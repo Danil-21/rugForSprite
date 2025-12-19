@@ -14,8 +14,16 @@ from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from rag_config import VECTOR_DB_DIR
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# =====================
+# Константы
+# =====================
+CONFIDENCE_THRESHOLD = 0.4  # 70% порог уверенности
 
 # =====================
 # Модели данных
@@ -27,7 +35,7 @@ class Source(BaseModel):
     source: Optional[str] = None
     snippet: str
     relevance: Optional[float] = None
-    url: Optional[str] = None  # Добавляем URL для ссылок
+    url: Optional[str] = None
     document_type: Optional[str] = None
 
 class Answer(BaseModel):
@@ -36,8 +44,10 @@ class Answer(BaseModel):
     priority: str  # low, medium, high
     route_to: Optional[str] = None  # L1 / L2 / L3
     judge_reason: str
-    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
-    confidence_details: Optional[Dict] = None  # Детали расчета уверенности
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    confidence_details: Optional[Dict] = None
+    confidence_interpretation: Optional[str] = None
+    confidence_below_threshold: bool = False  # Новое поле: уверенность ниже порога
 
 # =====================
 # Утилиты и конфигурация
@@ -49,7 +59,6 @@ STOP_WORDS = {
     "к", "с", "со", "во", "об", "то", "так", "вот", "тут"
 }
 
-# Сопоставление ключевых слов с разделами сайта Сбера
 SBER_SITE_SECTIONS = {
     "карта": "https://www.sberbank.ru/ru/person/bank_cards",
     "вклад": "https://www.sberbank.ru/ru/person/contributions",
@@ -73,20 +82,13 @@ SBER_SITE_SECTIONS = {
     "контакты": "https://www.sberbank.ru/ru/person/contacts",
 }
 
-# Базовые URL для документов
-DOCUMENT_URL_MAPPING = {
-    # Пример сопоставления имен файлов с URL
-    "акция_инвестируй со сбербанком": "https://www.sberbank.ru/ru/person/investments/promotions",
-    "восстановление доступа": "https://www.sberbank.ru/ru/person/sberbankonline/restore",
-    "обыкновенная акция": "https://www.sberbank.ru/ru/person/investments/securities",
-}
-
 HIGH_PRIORITY_TERMS = {
     "деньги", "счет", "карта", "перевод", "платеж", "списание", "мошенничество",
     "взлом", "кража", "блокировка", "заблокирован", "недоступен", "ошибка перевода",
     "потерял", "украли", "несанкционированный", "арест", "арестован", "конфискация",
     "арест счета", "заморожен", "срочно", "экстренно", "критично", "угроза",
-    "безопасность", "пароль", "вход", "взломали", "фишинг", "обман"
+    "безопасность", "пароль", "вход", "взломали", "фишинг", "обман", "сняли",
+    "пропали", "исчезли", "украден", "украдена", "заблокирована"
 }
 
 MEDIUM_PRIORITY_TERMS = {
@@ -94,15 +96,8 @@ MEDIUM_PRIORITY_TERMS = {
     "приложение", "онлайн", "интернет-банк", "мобильное приложение", "сайт",
     "доступ", "авторизация", "вход", "логин", "пароль", "восстановление",
     "забыл", "утеря", "смена", "номер телефона", "email", "контакты",
-    "настройки", "операция", "транзакция", "отказ", "отклонено", "не проходит"
-}
-
-LOW_PRIORITY_TERMS = {
-    "как узнать", "где найти", "информация", "справка", "обучение",
-    "инструкция", "руководство", "часто задаваемые", "faq", "вопрос",
-    "ответ", "документ", "реквизиты", "адрес", "телефон", "график",
-    "режим работы", "отделение", "банкомат", "условия", "тариф",
-    "комиссия", "процент", "ставка", "кредит", "вклад", "инвестиции"
+    "настройки", "операция", "транзакция", "отказ", "отклонено", "не проходит",
+    "не открывается", "зависает", "тормозит", "глючит", "баг"
 }
 
 def extract_core_terms(text: str) -> set:
@@ -114,7 +109,6 @@ def get_sber_site_url(question: str) -> Optional[str]:
     """Определяет наиболее релевантный раздел сайта Сбера для вопроса"""
     question_lower = question.lower()
     
-    # Ищем ключевые слова в вопросе
     for keyword, url in SBER_SITE_SECTIONS.items():
         if keyword in question_lower:
             return url
@@ -134,22 +128,13 @@ def generate_document_url(source_path: str, content: str) -> Optional[str]:
     
     filename = os.path.basename(source_path).lower()
     
-    # Пытаемся найти URL в самом документе
-    urls_in_content = extract_urls_from_text(content[:1000])  # Проверяем начало
+    urls_in_content = extract_urls_from_text(content[:1000])
     if urls_in_content:
-        # Фильтруем только URL Сбера
         sber_urls = [url for url in urls_in_content if 'sberbank' in url]
         if sber_urls:
             return sber_urls[0]
     
-    # Пытаемся сопоставить по имени файла
-    for doc_key, url in DOCUMENT_URL_MAPPING.items():
-        if doc_key.lower() in filename:
-            return url
-    
-    # Если это HTML файл, предполагаем что это страница сайта
     if source_path.endswith('.html'):
-        # Извлекаем возможный URL из метаданных или имени файла
         html_name = os.path.splitext(filename)[0]
         for keyword, url in SBER_SITE_SECTIONS.items():
             if keyword in html_name:
@@ -176,111 +161,323 @@ def context_supports_question(context: str, question: str, min_matches: int = 2)
     matches = sum(1 for term in terms if term in context_lower)
     return matches >= min_matches
 
+def get_relevancy_interpretation(score: float) -> str:
+    """Интерпретация релевантности документа"""
+    if score >= 0.9:
+        return "Очень высокая релевантность"
+    elif score >= 0.8:
+        return "Высокая релевантность"
+    elif score >= 0.7:
+        return "Хорошая релевантность"
+    elif score >= 0.6:
+        return "Средняя релевантность"
+    elif score >= 0.5:
+        return "Умеренная релевантность"
+    else:
+        return "Низкая релевантность"
+
+def analyze_answer_quality(answer: str, question: str) -> Dict:
+    """Улучшенный анализ качества ответа - менее строгий к терминологии"""
+    answer_lower = answer.lower()
+    question_lower = question.lower()
+    
+    scores = {}
+    
+    # 1. Длина ответа (более гибкая)
+    ideal_min_length = 30
+    ideal_max_length = 500
+    
+    if len(answer) < ideal_min_length:
+        length_score = len(answer) / ideal_min_length
+    elif len(answer) > ideal_max_length:
+        length_score = 1.0  # Длинные ответы - это хорошо
+    else:
+        length_score = 0.7 + (len(answer) - ideal_min_length) / (ideal_max_length - ideal_min_length) * 0.3
+    
+    length_score = max(0.3, min(1.0, length_score))
+    scores["length"] = {
+        "score": length_score,
+        "length": len(answer),
+        "ideal_range": f"{ideal_min_length}-{ideal_max_length}"
+    }
+    
+    # 2. Отсутствие негативных фраз (самый важный фактор)
+    negative_phrases = [
+        "информации нет", "не знаю", "не могу ответить", 
+        "нет данных", "не найдено", "неизвестно",
+        "к сожалению, я не могу", "не удалось найти",
+        "извините, но", "я не нашел"
+    ]
+    
+    has_negative = any(phrase in answer_lower for phrase in negative_phrases)
+    negative_score = 0.0 if has_negative else 1.0
+    scores["negatives"] = {
+        "score": negative_score,
+        "has_negative": has_negative
+    }
+    
+    # 3. Структура ответа
+    structure_patterns = [
+        r'\d+\.\s',  # Нумерованные списки
+        r'[-•*]\s',  # Маркированные списки
+        r'[Пп]ервый|[Вв]торой|[Тт]ретий',  # Порядковые номера
+    ]
+    
+    structure_matches = sum(1 for pattern in structure_patterns 
+                           if re.search(pattern, answer))
+    structure_score = min(structure_matches / 2, 1.0)  # Нормализуем к 2 паттернам
+    scores["structure"] = {
+        "score": structure_score,
+        "matches": structure_matches
+    }
+    
+    # 4. Конкретность (менее строгая)
+    if re.search(r'\d+', answer):  # Есть хоть какие-то цифры
+        specificity_score = 0.8
+    elif any(word in answer_lower for word in ['сбербанк', 'карта', 'счет', 'пароль']):
+        specificity_score = 0.7
+    else:
+        specificity_score = 0.5
+    
+    scores["specificity"] = {
+        "score": specificity_score
+    }
+    
+    # Итоговый счет качества (веса)
+    weights = {
+        "length": 0.15,
+        "negatives": 0.50,  # Самый важный - отсутствие "не знаю"
+        "structure": 0.20,
+        "specificity": 0.15
+    }
+    
+    total_score = sum(scores[key]["score"] * weights[key] for key in weights)
+    scores["total_score"] = total_score
+    scores["weights"] = weights
+    
+    return scores
+
+def calculate_qa_similarity(question: str, answer: str) -> float:
+    """Рассчитывает семантическую схожесть вопроса и ответа"""
+    stop_words = STOP_WORDS.union({
+        'вас', 'вам', 'ваш', 'наш', 'свой', 'свои', 'своей',
+        'этот', 'эта', 'это', 'эти', 'такой', 'такая', 'такое'
+    })
+    
+    question_terms = set(
+        word.lower() for word in re.findall(r'\b\w{3,}\b', question)
+        if word.lower() not in stop_words
+    )
+    
+    answer_terms = set(
+        word.lower() for word in re.findall(r'\b\w{3,}\b', answer)
+        if word.lower() not in stop_words
+    )
+    
+    if not question_terms or not answer_terms:
+        return 0.3
+    
+    intersection = len(question_terms.intersection(answer_terms))
+    union = len(question_terms.union(answer_terms))
+    
+    if union == 0:
+        return 0.0
+    
+    similarity = intersection / union
+    
+    important_terms = {'сбербанк', 'карта', 'счет', 'деньги', 'перевод', 'безопасность'}
+    important_matches = len(important_terms.intersection(question_terms.intersection(answer_terms)))
+    
+    similarity += important_matches * 0.1
+    return min(similarity, 1.0)
+
 def calculate_confidence(
     docs_with_scores: List[Tuple],
     question: str,
     answer: str,
-    context: str
-) -> Tuple[float, Dict]:
+    context: str,
+    priority: str
+) -> Tuple[float, Dict, str]:
     """
-    Рассчитывает уверенность агента в ответе
+    Улучшенный расчет уверенности - без строгого Q/A similarity
     
-    Возвращает:
-    - confidence_score (0.0-1.0)
-    - confidence_details (детали расчета)
+    Новые факторы:
+    1. Релевантность лучшего документа (30%)
+    2. Средняя релевантность топ-3 (20%)
+    3. Качество ответа (35%) ← УВЕЛИЧЕНО
+    4. Соответствие ответа контексту (15%) ← ВМЕСТО Q/A similarity
     """
     details = {
         "calculation_time": datetime.now().isoformat(),
-        "factors": {}
+        "factors": {},
+        "question_preview": question[:100],
+        "answer_length": len(answer),
+        "calculation_method": "v3_context_alignment"
     }
     
     if not docs_with_scores:
         details["factors"]["no_documents"] = "Документы не найдены"
-        return 0.0, details
+        interpretation = "Очень низкая уверенность (нет документов)"
+        details["interpretation"] = interpretation
+        return 0.1, details, interpretation
     
-    # Фактор 1: Релевантность документов (вес 40%)
+    # Анализируем документы
     relevancy_scores = [1.0 - score for _, score in docs_with_scores]
-    avg_relevancy = sum(relevancy_scores) / len(relevancy_scores)
-    details["factors"]["document_relevancy"] = {
-        "average": avg_relevancy,
-        "scores": relevancy_scores,
-        "count": len(docs_with_scores)
+    
+    # Фактор 1: Релевантность ЛУЧШЕГО документа (вес 30%)
+    best_relevancy = max(relevancy_scores) if relevancy_scores else 0
+    details["factors"]["best_document_relevancy"] = {
+        "score": best_relevancy,
+        "interpretation": get_relevancy_interpretation(best_relevancy)
     }
+    relevancy_factor = best_relevancy * 0.3
     
-    relevancy_factor = avg_relevancy * 0.4
-    
-    # Фактор 2: Количество релевантных документов (вес 20%)
-    good_docs = sum(1 for score in relevancy_scores if score > 0.7)
-    doc_count_factor = min(good_docs / 3, 1.0) * 0.2
-    details["factors"]["document_count"] = {
-        "good_docs": good_docs,
-        "total_docs": len(docs_with_scores),
-        "factor": doc_count_factor
+    # Фактор 2: Средняя релевантность ТОП-3 документов (вес 20%)
+    top_n = min(3, len(relevancy_scores))
+    top_relevancy_scores = sorted(relevancy_scores, reverse=True)[:top_n]
+    avg_top_relevancy = sum(top_relevancy_scores) / len(top_relevancy_scores)
+    details["factors"]["top_documents_relevancy"] = {
+        "average": avg_top_relevancy,
+        "scores": top_relevancy_scores,
+        "count": top_n
     }
+    top_relevancy_factor = avg_top_relevancy * 0.2
     
-    # Фактор 3: Совпадение ключевых терминов (вес 20%)
-    question_terms = extract_core_terms(question)
-    answer_terms = extract_core_terms(answer)
+    # Фактор 3: Качество и полнота ответа (вес 35%) ← УВЕЛИЧЕНО
+    answer_quality_score = analyze_answer_quality(answer, question)
+    details["factors"]["answer_quality"] = answer_quality_score
+    quality_factor = answer_quality_score["total_score"] * 0.35
     
-    if question_terms:
-        term_overlap = len(question_terms.intersection(answer_terms)) / len(question_terms)
-    else:
-        term_overlap = 0.5
-    
-    term_factor = term_overlap * 0.2
-    details["factors"]["term_overlap"] = {
-        "question_terms": list(question_terms),
-        "answer_terms": list(answer_terms),
-        "overlap_ratio": term_overlap,
-        "factor": term_factor
+    # Фактор 4: Соответствие ответа контексту (вес 15%) ← НОВЫЙ ВМЕСТО Q/A similarity
+    context_alignment = calculate_context_alignment(answer, context)
+    details["factors"]["context_alignment"] = {
+        "score": context_alignment,
+        "method": "answer_terms_in_context"
     }
-    
-    # Фактор 4: Качество ответа (вес 20%)
-    answer_quality = 0.0
-    answer_lower = answer.lower()
-    
-    # Положительные признаки
-    positive_indicators = [
-        len(answer) > 50,  # Ответ не слишком короткий
-        not any(phrase in answer_lower for phrase in [
-            "не знаю", "информации нет", "не могу ответить"
-        ]),
-        any(word in answer_lower for word in [
-            "шаг", "инструкция", "необходимо", "требуется", "можно"
-        ])
-    ]
-    
-    answer_quality = sum(positive_indicators) / len(positive_indicators)
-    quality_factor = answer_quality * 0.2
-    details["factors"]["answer_quality"] = {
-        "indicators": positive_indicators,
-        "quality_score": answer_quality,
-        "factor": quality_factor
-    }
+    alignment_factor = context_alignment * 0.15
     
     # Итоговая уверенность
-    confidence_score = relevancy_factor + doc_count_factor + term_factor + quality_factor
+    confidence_score = (
+        relevancy_factor + 
+        top_relevancy_factor + 
+        quality_factor + 
+        alignment_factor
+    )
     
-    # Ограничиваем диапазон
+    # БОНУС: Если есть конкретные инструкции в ответе
+    if has_concrete_instructions(answer):
+        confidence_score = min(confidence_score + 0.1, 1.0)
+        details["factors"]["concrete_instructions_bonus"] = 0.1
+    
+    # Ограничиваем диапазон и округляем
     confidence_score = max(0.0, min(1.0, confidence_score))
+    confidence_score = round(confidence_score, 3)
     
-    # Добавляем интерпретацию
-    if confidence_score > 0.8:
-        interpretation = "Высокая уверенность"
-    elif confidence_score > 0.6:
-        interpretation = "Средняя уверенность"
-    elif confidence_score > 0.3:
-        interpretation = "Низкая уверенность"
-    else:
-        interpretation = "Очень низкая уверенность"
-    
+    # Интерпретация
+    interpretation = get_confidence_interpretation(confidence_score, priority)
     details["interpretation"] = interpretation
     details["final_score"] = confidence_score
     
-    return confidence_score, details
+    # Логируем факторы для отладки
+    logger.info(f"📊 УВЕРЕННОСТЬ v3:")
+    logger.info(f"   Лучшая релевантность: {best_relevancy:.2%}")
+    logger.info(f"   Средняя топ-3: {avg_top_relevancy:.2%}")
+    logger.info(f"   Качество ответа: {answer_quality_score['total_score']:.2%}")
+    logger.info(f"   Соответствие контексту: {context_alignment:.2%}")
+    logger.info(f"   ИТОГО: {confidence_score:.2%}")
+    
+    return confidence_score, details, interpretation
+
+
+def calculate_context_alignment(answer: str, context: str) -> float:
+    """
+    Насколько хорошо ответ соответствует предоставленному контексту
+    """
+    if not answer or not context:
+        return 0.5
+    
+    answer_lower = answer.lower()
+    context_lower = context.lower()
+    
+    # Извлекаем ключевые термины из ответа (игнорируем стоп-слова)
+    answer_terms = set(
+        word for word in re.findall(r'\b\w{3,}\b', answer_lower)
+        if word not in STOP_WORDS
+    )
+    
+    if not answer_terms:
+        return 0.5
+    
+    # Сколько терминов из ответа есть в контексте
+    context_terms = set(
+        word for word in re.findall(r'\b\w{3,}\b', context_lower[:2000])
+        if word not in STOP_WORDS
+    )
+    
+    matches = len(answer_terms.intersection(context_terms))
+    alignment = matches / len(answer_terms)
+    
+    # Бонусы за качественные ответы
+    bonuses = 0.0
+    
+    # 1. Бонус за инструкционные слова
+    instruction_words = {'шаг', 'действие', 'необходимо', 'нужно', 'требуется', 
+                        'можно', 'следует', 'рекомендуется', 'советуем'}
+    if any(word in answer_lower for word in instruction_words):
+        bonuses += 0.15
+    
+    # 2. Бонус за конкретные данные (номера, телефоны, суммы)
+    if re.search(r'\d+', answer):
+        bonuses += 0.10
+    
+    # 3. Бонус за ссылки или упоминание сайта
+    if 'sberbank.ru' in answer_lower or 'https://' in answer_lower:
+        bonuses += 0.10
+    
+    alignment = min(alignment + bonuses, 1.0)
+    
+    # Гарантируем минимальный уровень
+    return min(max(alignment, 0.4), 1.0)  # Минимум 40%
+
+
+def has_concrete_instructions(answer: str) -> bool:
+    """Проверяет, содержит ли ответ конкретные инструкции"""
+    answer_lower = answer.lower()
+    
+    # Паттерны конкретных инструкций
+    patterns = [
+        r'\d+\.\s',  # Нумерованные списки
+        r'[-•*]\s',  # Маркированные списки
+        r'шаг\s+\d+',  # Шаг 1, Шаг 2
+        r'сначала\s+', r'затем\s+', r'после\s+',  # Последовательность
+        r'нажмите\s+', r'выберите\s+', r'введите\s+',  # Конкретные действия
+    ]
+    
+    return any(re.search(pattern, answer_lower) for pattern in patterns)
+
+
+def get_confidence_interpretation(score: float, priority: str) -> str:
+    """Интерпретация итоговой уверенности"""
+    if score >= 0.85:
+        base = "Очень высокая уверенность"
+    elif score >= 0.70:
+        base = "Высокая уверенность"
+    elif score >= 0.55:
+        base = "Средняя уверенность"
+    elif score >= 0.40:
+        base = "Умеренная уверенность"
+    elif score >= 0.25:
+        base = "Низкая уверенность"
+    else:
+        base = "Очень низкая уверенность"
+    
+    if priority == "high" and score > 0.7:
+        return f"{base} (с учетом важности вопроса)"
+    
+    return base
 
 def get_question_priority_keywords(question: str) -> str:
-    """Определяет приоритет по ключевым словам (для клиентов)"""
+    """Определяет приоритет по ключевым словам"""
     q_lower = question.lower()
     
     if any(term in q_lower for term in HIGH_PRIORITY_TERMS):
@@ -289,13 +486,112 @@ def get_question_priority_keywords(question: str) -> str:
     if any(term in q_lower for term in MEDIUM_PRIORITY_TERMS):
         return "medium"
     
-    if any(term in q_lower for term in LOW_PRIORITY_TERMS):
-        return "low"
-    
     return "low"
 
+def needs_immediate_escalation(confidence: float, priority: str) -> Tuple[bool, str]:
+    """
+    Определяет, требуется ли немедленная эскалация
+    
+    Возвращает:
+    - нужно_ли_эскалировать (bool)
+    - причина (str)
+    """
+    # Если уверенность ниже порога
+    if confidence < CONFIDENCE_THRESHOLD:
+        if priority == "high":
+            return True, f"Уверенность {confidence:.1%} ниже порога {CONFIDENCE_THRESHOLD:.0%} при высоком приоритете вопроса"
+        elif priority == "medium":
+            return True, f"Уверенность {confidence:.1%} ниже порога {CONFIDENCE_THRESHOLD:.0%}"
+        else:
+            # Для low приоритета все равно эскалируем, но на L1
+            return True, f"Уверенность {confidence:.1%} ниже порога {CONFIDENCE_THRESHOLD:.0%}"
+    
+    return False, ""
+
+def get_escalation_level(priority: str, confidence: float) -> Tuple[str, str]:
+    """
+    Определяет уровень эскалации
+    
+    Возвращает:
+    - уровень (L1/L2/L3)
+    - причина
+    """
+    # Для HIGH приоритета - всегда L3, независимо от уверенности
+    if priority == "high":
+        if confidence < CONFIDENCE_THRESHOLD:
+            return "L3", f"Критическая проблема с финансами/безопасностью. Уверенность {confidence:.1%} < {CONFIDENCE_THRESHOLD:.0%}"
+        else:
+            return "L3", "Высокий приоритет вопроса (финансы/безопасность) требует экспертной проверки на L3"
+    
+    # Для остальных приоритетов - по уверенности
+    if confidence < CONFIDENCE_THRESHOLD:
+        if priority == "medium":
+            return "L2", f"Техническая проблема требует специалиста. Уверенность {confidence:.1%} < {CONFIDENCE_THRESHOLD:.0%}"
+        else:  # low
+            return "L1", f"Информационный вопрос требует уточнения. Уверенность {confidence:.1%} < {CONFIDENCE_THRESHOLD:.0%}"
+    
+    # Если уверенность выше порога и не HIGH - маршрутизация не нужна
+    return None, ""
+
+
+def generate_low_confidence_response(priority: str, confidence: float, reason: str) -> Tuple[str, str]:
+    """
+    Генерирует ответ при низкой уверенности
+    
+    Возвращает:
+    - ответ для клиента
+    - уровень маршрутизации
+    """
+    if priority == "high":
+        answer = (
+            f"🔴 **СРОЧНО! ВАШ ВОПРОС ПЕРЕДАН СПЕЦИАЛИСТАМ БЕЗОПАСНОСТИ (L3)**\n\n"
+            f"Ваш вопрос требует немедленного вмешательства специалистов по безопасности.\n\n"
+            f"**НЕМЕДЛЕННЫЕ ДЕЙСТВИЯ:**\n"
+            f"1. 📞 **Позвоните в службу безопасности Сбербанка: 900** (с мобильного) или **+7 (495) 500-55-50**\n"
+            f"2. 🚫 **Немедленно заблокируйте карту** через мобильное приложение СберБанк Онлайн\n"
+            f"3. 🏦 **Обратитесь в ближайшее отделение** с паспортом\n\n"
+            f"**Информация об обращении:**\n"
+            f"• Уровень обработки: **L3 (специалисты безопасности)**\n"
+            f"• Время ответа: **в течение 15 минут**\n"
+            f"• Телефон для срочных вопросов: **900**\n\n"
+            f"*Причина эскалации: {reason}*"
+        )
+        return answer, "L3"
+    
+    elif priority == "medium":
+        answer = (
+            f"🔄 **ВАШ ВОПРОС ПЕРЕДАН ТЕХНИЧЕСКОМУ СПЕЦИАЛИСТУ (L2)**\n\n"
+            f"Для решения вашего вопроса требуется помощь технического специалиста.\n\n"
+            f"**Рекомендуемые действия:**\n"
+            f"1. 📞 **Позвоните в техническую поддержку: 900**\n"
+            f"2. 🌐 Посетите сайт: www.sberbank.ru\n"
+            f"3. 📱 Используйте мобильное приложение\n\n"
+            f"**Информация об обращении:**\n"
+            f"• Уровень обработки: **L2 (технические специалисты)**\n"
+            f"• Время ответа: **в течение 2 часов**\n"
+            f"• Телефон поддержки: **900**\n\n"
+            f"*Причина эскалации: {reason}*"
+        )
+        return answer, "L2"
+    
+    else:
+        answer = (
+            f"ℹ️ **ВАШ ВОПРОС ПЕРЕДАН КОНСУЛЬТАНТУ (L1)**\n\n"
+            f"Для получения точной информации ваш вопрос передан консультанту.\n\n"
+            f"**Вы можете:**\n"
+            f"1. 📞 **Позвонить в справочную службу: 900**\n"
+            f"2. 🌐 Найти информацию на сайте: www.sberbank.ru\n"
+            f"3. 🏦 Обратиться в отделение банка\n\n"
+            f"**Информация об обращении:**\n"
+            f"• Уровень обработки: **L1 (консультанты)**\n"
+            f"• Время ответа: **в течение 4 часов**\n"
+            f"• Телефон справочной: **900**\n\n"
+            f"*Причина эскалации: {reason}*"
+        )
+        return answer, "L1"
+
 # =====================
-# Промпты (ориентированные на клиентов)
+# Промпты
 # =====================
 PRIORITY_PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -322,15 +618,6 @@ JUDGE_PROMPT = ChatPromptTemplate.from_messages([
 Твоя задача — определить:
 1. Насколько полно и полезно ответил агент
 2. Нужна ли дополнительная помощь сотрудника ПОСЛЕ ответа агента
-
-НОВЫЕ ПРАВИЛА:
-1. Агент ВСЕГДА пытается ответить, если есть информация в документах
-2. После ответа оцениваем: достаточно ли этого ответа или нужен сотрудник
-3. Сотрудник нужен если:
-   - Ответ неполный или непонятный
-   - Требуются действия сотрудника (разблокировка, проверка операций)
-   - Клиенту нужно общение с живым человеком
-   - Вопрос слишком сложный для текстового ответа
 
 Верни СТРОГО JSON:
 
@@ -360,32 +647,38 @@ route_to != null если после ответа агента нужны дей
 ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """Ты — AI-агент первой линии поддержки Сбербанка для клиентов.
+        """Ты — AI-агент первой линии поддержки внутренних сервисов Сбербанка.
 Твоя задача — помогать клиентам решать их вопросы, используя информацию из базы знаний.
 
 ВАЖНЫЕ ПРАВИЛА:
 1. Отвечай ТОЛЬКО на основе предоставленного контекста
-2. Будь максимально полезным и конкретным
-3. Если в контексте есть URL на сайт Сбера - включи их в ответ
-4. Если информации недостаточно - честно скажи
-5. Дай максимально полный ответ из имеющейся информации
+2. Дай прямой ответ на вопрос без лишних приветствий
+3. Если информации достаточно для решения проблемы — предоставь пошаговую инструкцию
+4. Если в контексте есть URL на сайт Сбера - включи их в ответ
+5. Если информации недостаточно — честно скажи что нужно передать вопрос специалисту
+6. НИКОГДА не спрашивай "помог ли ответ" или "понятно ли объяснил"
 
 СТИЛЬ ОБЩЕНИЯ:
-- Вежливо и профессионально
-- Простыми словами
-- С эмпатией
-- Конкретно и по делу
-- Если есть ссылки на сайт - добавь их в конце"""
+- Профессионально, но без формальностей
+- Только по делу
+- Четко, конкретно, с нумерованными шагами при необходимости
+- Без эмпатии и лишних слов (время ответа критично)
+
+ФОРМАТ ОТВЕТА:
+- Прямой ответ на вопрос
+- Если нужны действия: 1. Сделай это. 2. Затем это. 3. Проверь то.
+- Если нужно передать специалисту: "Для решения вопроса требуется подключение специалиста поддержки. Обращение создано."
+"""
     ),
     (
         "human",
-        """ИНФОРМАЦИЯ ИЗ БАЗЫ ЗНАНИЙ СБЕРБАНКА:
+        """БАЗА ЗНАНИЙ ВНУТРЕННИХ СЕРВИСОВ:
 {context}
 
-ВОПРОС КЛИЕНТА:
+ВОПРОС СОТРУДНИКА:
 {question}
 
-ТВОЙ ОТВЕТ КЛИЕНТУ (включи ссылки если они есть в контексте):"""
+ТВОЙ ОТВЕТ:"""
     )
 ])
 
@@ -411,6 +704,19 @@ def detect_priority(llm, question: str) -> str:
         result = result.strip().upper()
         if result in {"LOW", "MEDIUM", "HIGH"}:
             logger.info(f"LLM определил приоритет: {result}")
+            
+            # Дополнительная проверка для критических фраз
+            question_lower = question.lower()
+            critical_phrases = [
+                "украли", "потерял", "мошенничество", "взлом", "кража", 
+                "списали", "несанкционирован", "пропали деньги", "украден",
+                "заблокирова", "арест", "конфискация"
+            ]
+            
+            if any(phrase in question_lower for phrase in critical_phrases):
+                logger.info(f"⚠️ Обнаружена критическая фраза, повышаем приоритет до HIGH")
+                return "HIGH"
+            
             return result
     except Exception as e:
         logger.warning(f"Ошибка при определении приоритета LLM: {e}")
@@ -487,199 +793,6 @@ def judge_answer(llm, question: str, answer: str, context: str, priority: str) -
             "reason": "Ошибка оценки, считаем что агент ответил"
         }
 
-def needs_human_after_answer(question: str, answer: str, priority: str) -> bool:
-    """Определяет, нужен ли сотрудник ПОСЛЕ того как агент ответил"""
-    answer_lower = answer.lower()
-    
-    if priority == "high":
-        if "как узнать" in question.lower() or "где найти" in question.lower():
-            return False
-        return True
-    
-    if priority == "medium":
-        if any(phrase in answer_lower for phrase in [
-            "позвоните", "обратитесь к", "свяжитесь с", "позвонить в поддержку"
-        ]):
-            return True
-    
-    return False
-
-def generate_enhanced_answer(original_answer: str, question: str, priority: str, 
-                           helped: bool, sources: List[Source]) -> str:
-    """Улучшает ответ для клиента, добавляя информацию о маршрутизации если нужно"""
-    
-    # Собираем все уникальные URL из источников
-    source_urls = []
-    for source in sources:
-        if source.url and is_valid_sber_url(source.url):
-            source_urls.append(source.url)
-    
-    # Также получаем общий URL для вопроса
-    question_url = get_sber_site_url(question)
-    if question_url and question_url not in source_urls:
-        source_urls.append(question_url)
-    
-    # Удаляем дубликаты
-    source_urls = list(set(source_urls))
-    
-    enhanced_answer = original_answer
-    
-    # Добавляем ссылки если они есть
-    if source_urls and helped:
-        links_text = "\n\n🔗 **Полезные ссылки:**\n"
-        for i, url in enumerate(source_urls[:3], 1):  # Ограничиваем 3 ссылками
-            links_text += f"{i}. {url}\n"
-        enhanced_answer += links_text
-    
-    if not helped:
-        if priority == "high":
-            enhanced_answer += (
-                "\n\n🔴 Поскольку это срочный вопрос, связанный с безопасностью или деньгами, "
-                "рекомендую НЕМЕДЛЕННО позвонить на горячую линию Сбербанка: 900."
-            )
-        elif priority == "medium":
-            enhanced_answer += (
-                "\n\nДля решения этого вопроса потребуется помощь специалиста поддержки. "
-                "Пожалуйста, обратитесь в службу поддержки Сбербанка по телефону 900."
-            )
-    
-    elif priority == "high" and needs_human_after_answer(question, original_answer, priority):
-        enhanced_answer += (
-            "\n\n⚠️ **После выполнения этих действий обязательно позвоните на горячую линию 900 "
-            "для подтверждения и завершения процедуры.**"
-        )
-    
-    elif priority == "medium" and needs_human_after_answer(question, original_answer, priority):
-        enhanced_answer += (
-            "\n\n📞 Если у вас остались вопросы или нужна дополнительная помощь, "
-            "обратитесь в поддержку по телефону 900."
-        )
-    
-    # Добавляем вежливое завершение
-    import random
-    endings = [
-        "\n\nНадеюсь, эта информация была полезной!",
-        "\n\nЕсли нужна дополнительная помощь - обращайтесь!",
-        "\n\nЖелаю удачного дня!",
-        "\n\nВсего доброго!"
-    ]
-    
-    ending = random.choice(endings)
-    return enhanced_answer + ending
-
-def format_sources(docs_with_scores, max_sources: int = 3) -> List[Source]:
-    """Форматирует источники для ответа клиенту с URL"""
-    sources = []
-    
-    for doc, score in docs_with_scores[:max_sources]:
-        snippet = doc.page_content[:300].strip()
-        if len(doc.page_content) > 300:
-            snippet += "..."
-        
-        source_path = doc.metadata.get("source", "")
-        doc_type = doc.metadata.get("type", "document")
-        
-        # Генерируем URL для документа
-        doc_url = generate_document_url(source_path, doc.page_content)
-        
-        if doc_type == "pdf":
-            source_display = "Официальный документ Сбербанка"
-        elif doc_type == "html":
-            source_display = "Информация с сайта Сбербанка"
-        else:
-            source_display = "База знаний Сбербанка"
-        
-        sources.append(Source(
-            source=source_display,
-            snippet=snippet,
-            relevance=1.0 - score,
-            url=doc_url if is_valid_sber_url(doc_url) else None,
-            document_type=doc_type
-        ))
-    
-    return sources
-
-def log_confidence_metrics(question: str, confidence: float, details: Dict):
-    """Логирует метрики уверенности для аналитики"""
-    log_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "question": question,
-        "confidence": confidence,
-        "details": details,
-        "interpretation": details.get("interpretation", "unknown")
-    }
-    
-    # Логируем в консоль
-    logger.info(f"📊 Уверенность агента: {confidence:.2%} - {details.get('interpretation', 'unknown')}")
-    logger.debug(f"Детали уверенности: {json.dumps(details, ensure_ascii=False, indent=2)}")
-    
-    # Также можно сохранять в файл для аналитики
-    try:
-        log_file = "confidence_metrics.log"
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logger.warning(f"Не удалось записать метрики в файл: {e}")
-
-def no_answer(priority: str, found_docs: bool = False) -> Answer:
-    """Формирует ответ когда информации нет"""
-    
-    if found_docs:
-        if priority == "HIGH":
-            answer_text = (
-                "Я нашел информацию по вашей теме, но не смог сформулировать точный ответ. "
-                "Поскольку вопрос срочный, пожалуйста, немедленно позвоните на горячую линию: 900."
-            )
-            route = "L3"
-        elif priority == "MEDIUM":
-            answer_text = (
-                "По вашему вопросу есть информация, но для точного решения требуется помощь специалиста. "
-                "Обратитесь в поддержку по телефону 900."
-            )
-            route = "L2"
-        else:
-            answer_text = (
-                "По вашему вопросу есть некоторая информация, но она неполная. "
-                "Вы можете уточнить на сайте Сбербанка или позвонить по телефону 900."
-            )
-            route = "L1"
-    else:
-        if priority == "HIGH":
-            answer_text = (
-                "🔴 Срочный вопрос! Информации по вашему запросу нет в моей базе. "
-                "Пожалуйста, НЕМЕДЛЕННО позвоните на горячую линию Сбербанка: 900."
-            )
-            route = "L3"
-        elif priority == "MEDIUM":
-            answer_text = (
-                "Информации по вашему вопросу нет в моей базе знаний. "
-                "Для решения проблемы обратитесь в службу поддержки по телефону 900."
-            )
-            route = "L2"
-        else:
-            answer_text = (
-                "К сожалению, у меня нет информации по вашему вопросу. "
-                "Вы можете найти подробности на сайте Сбербанка www.sberbank.ru "
-                "или позвонить в справочную службу по телефону 900."
-            )
-            route = "L1"
-    
-    # Рассчитываем низкую уверенность для no_answer
-    confidence, details = calculate_confidence([], question="", answer=answer_text, context="")
-    
-    # Логируем метрики
-    log_confidence_metrics("", confidence, details)
-    
-    return Answer(
-        answer=answer_text,
-        sources=[],
-        priority=priority.lower(),
-        route_to=route,
-        judge_reason="Информация не найдена или неполная в базе знаний",
-        confidence=confidence,
-        confidence_details=details
-    )
-
 def expand_query(llm, question: str) -> List[str]:
     """Расширяет запрос клиента для улучшения поиска"""
     expansions = [question]
@@ -703,18 +816,70 @@ def expand_query(llm, question: str) -> List[str]:
     
     return expansions
 
+def format_sources(docs_with_scores, max_sources: int = 3) -> List[Source]:
+    """Форматирует источники для ответа клиенту с URL"""
+    sources = []
+    
+    for doc, score in docs_with_scores[:max_sources]:
+        snippet = doc.page_content[:300].strip()
+        if len(doc.page_content) > 300:
+            snippet += "..."
+        
+        source_path = doc.metadata.get("source", "")
+        doc_type = doc.metadata.get("type", "document")
+        
+        doc_url = generate_document_url(source_path, doc.page_content)
+        
+        if doc_type == "pdf":
+            source_display = "Официальный документ Сбербанка"
+        elif doc_type == "html":
+            source_display = "Информация с сайта Сбербанка"
+        else:
+            source_display = "База знаний Сбербанка"
+        
+        sources.append(Source(
+            source=source_display,
+            snippet=snippet,
+            relevance=1.0 - score,
+            url=doc_url if is_valid_sber_url(doc_url) else None,
+            document_type=doc_type
+        ))
+    
+    return sources
+
+def log_confidence_metrics(question: str, confidence: float, details: Dict):
+    """Логирует метрики уверенности для аналитики"""
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "question": question[:200],
+        "confidence": confidence,
+        "interpretation": details.get("interpretation", "unknown"),
+        "priority": details.get("priority", "unknown"),
+        "factors": details.get("factors", {})
+    }
+    
+    logger.info(f"📊 УВЕРЕННОСТЬ: {confidence:.2%} - {details.get('interpretation', 'unknown')}")
+    
+    try:
+        log_file = "confidence_metrics.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Не удалось записать метрики в файл: {e}")
+
 # =====================
 # Приложение FastAPI
 # =====================
 def create_app() -> FastAPI:
     app = FastAPI(
         title="SberBank Client Support AI Agent",
-        version="2.3.0",
-        description="AI-агент первой линии поддержки для клиентов Сбербанка",
+        version="3.0.0",
+        description="AI-агент первой линии поддержки для клиентов Сбербанка с оценкой уверенности",
     )
     
     # Инициализация компонентов
     logger.info("Инициализация AI-агента поддержки клиентов...")
+    logger.info(f"Порог уверенности: {CONFIDENCE_THRESHOLD:.0%}")
     
     try:
         embeddings = HuggingFaceEmbeddings(
@@ -751,49 +916,65 @@ def create_app() -> FastAPI:
     async def root():
         return {
             "service": "AI Agent - First Line Support for SberBank Clients",
-            "version": "2.3.0",
+            "version": "3.0.0",
             "status": "active",
+            "confidence_threshold": f"{CONFIDENCE_THRESHOLD:.0%}",
+            "logic": "Если уверенность < 70% → эскалация без ответа",
             "features": [
-                "Ответы на вопросы клиентов",
-                "Автоматическая оценка уверенности",
+                "Оценка уверенности ответа",
+                "Автоматическая эскалация при низкой уверенности",
                 "Ссылки на сайт Сбербанка",
-                "Умная маршрутизация",
-                "Подробная аналитика"
+                "Умная маршрутизация по приоритету"
             ],
             "endpoints": {
                 "ask": "POST /ask - задать вопрос от лица клиента",
                 "health": "GET /health - проверка работоспособности",
-                "confidence_metrics": "GET /confidence - получить метрики уверенности"
+                "confidence_stats": "GET /confidence - получить статистику уверенности"
             }
         }
     
     @app.get("/confidence")
-    async def get_confidence_metrics():
-        """Получить последние метрики уверенности"""
+    async def get_confidence_stats():
+        """Получить статистику по уверенности агента"""
         try:
             log_file = "confidence_metrics.log"
             if os.path.exists(log_file):
                 with open(log_file, "r", encoding="utf-8") as f:
-                    lines = f.readlines()[-50:]  # Последние 50 записей
-                metrics = [json.loads(line) for line in lines]
+                    lines = f.readlines()[-100:]  # Последние 100 записей
                 
-                # Статистика
-                if metrics:
-                    confidences = [m.get("confidence", 0) for m in metrics]
-                    avg_confidence = sum(confidences) / len(confidences)
-                    
-                    return {
-                        "total_entries": len(metrics),
-                        "average_confidence": avg_confidence,
-                        "recent_entries": metrics[-10:],  # Последние 10 записей
-                        "interpretation_distribution": {
-                            "high": len([m for m in metrics if m.get("confidence", 0) > 0.8]),
-                            "medium": len([m for m in metrics if 0.6 < m.get("confidence", 0) <= 0.8]),
-                            "low": len([m for m in metrics if 0.3 < m.get("confidence", 0) <= 0.6]),
-                            "very_low": len([m for m in metrics if m.get("confidence", 0) <= 0.3])
-                        }
-                    }
-                return {"message": "Нет данных о метриках"}
+                if not lines:
+                    return {"message": "Нет данных о метриках"}
+                
+                metrics = [json.loads(line) for line in lines if line.strip()]
+                
+                confidences = [m.get("confidence", 0) for m in metrics]
+                avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+                
+                # Подсчет по интерпретациям
+                interpretations = {}
+                for m in metrics:
+                    interpretation = m.get("interpretation", "unknown")
+                    interpretations[interpretation] = interpretations.get(interpretation, 0) + 1
+                
+                # Подсчет по порогу
+                below_threshold = len([c for c in confidences if c < CONFIDENCE_THRESHOLD])
+                above_threshold = len([c for c in confidences if c >= CONFIDENCE_THRESHOLD])
+                
+                return {
+                    "total_entries": len(metrics),
+                    "average_confidence": f"{avg_confidence:.2%}",
+                    "threshold": f"{CONFIDENCE_THRESHOLD:.0%}",
+                    "below_threshold": below_threshold,
+                    "above_threshold": above_threshold,
+                    "below_threshold_percentage": f"{(below_threshold/len(metrics))*100:.1f}%" if metrics else "0%",
+                    "interpretation_distribution": interpretations,
+                    "recent_confidence_scores": confidences[-10:],
+                    "recent_questions": [
+                        {"question": m.get("question_preview", m.get("question", "N/A")[:50]),
+                         "confidence": m.get("confidence", 0)}
+                        for m in metrics[-5:]
+                    ]
+                }
             return {"message": "Файл метрик не найден"}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Ошибка получения метрик: {str(e)}")
@@ -809,13 +990,13 @@ def create_app() -> FastAPI:
                 detail="Вопрос слишком короткий. Пожалуйста, опишите вашу проблему подробнее."
             )
         
-        logger.info(f"Вопрос от клиента: {question}")
+        logger.info(f"🔍 ВОПРОС: '{question}'")
         
         # 1. Определяем приоритет
         priority = detect_priority(llm, question)
-        logger.info(f"Определен приоритет: {priority}")
+        logger.info(f"📊 Приоритет: {priority}")
         
-        # 2. Расширяем запрос
+        # 2. Расширяем запрос для лучшего поиска
         expanded_queries = expand_query(llm, question)
         
         # 3. Ищем релевантные документы
@@ -825,6 +1006,7 @@ def create_app() -> FastAPI:
             try:
                 docs_scores = vectordb.similarity_search_with_score(query, k=10)
                 all_docs_with_scores.extend(docs_scores)
+                logger.debug(f"По запросу '{query}' найдено {len(docs_scores)} документов")
             except Exception as e:
                 logger.warning(f"Ошибка поиска по запросу '{query}': {e}")
         
@@ -839,17 +1021,44 @@ def create_app() -> FastAPI:
         sorted_docs = sorted(unique_docs.values(), key=lambda x: x[1])
         
         if not sorted_docs:
-            logger.warning("Документы не найдены в базе знаний")
-            return no_answer(priority, found_docs=False)
+            logger.warning("❌ Документы не найдены в базе знаний")
+            # НЕ создаем пустой ответ - сразу эскалация
+            confidence = 0.1  # Минимальная уверенность
+            confidence_details = {
+                "calculation_time": datetime.now().isoformat(),
+                "factors": {"no_documents": "Документы не найдены"},
+                "interpretation": "Очень низкая уверенность (нет документов)"
+            }
+            
+            # Всегда эскалируем если документов нет
+            needs_escalation = True
+            escalation_reason = "Информация по вопросу не найдена в базе знаний"
+            
+            escalation_level, level_reason = get_escalation_level(priority, confidence)
+            answer_text, final_route = generate_low_confidence_response(
+                priority, confidence, f"{escalation_reason}. {level_reason}"
+            )
+            
+            return Answer(
+                answer=answer_text,
+                sources=[],
+                priority=priority.lower(),
+                route_to=final_route,
+                judge_reason=f"Документы не найдены. {escalation_reason}",
+                confidence=confidence,
+                confidence_details=confidence_details,
+                confidence_interpretation="Очень низкая уверенность (нет документов)",
+                confidence_below_threshold=True
+            )
         
-        logger.info(f"Найдено {len(sorted_docs)} документов")
+        logger.info(f"📚 Найдено {len(sorted_docs)} документов")
         
-        # 4. Формируем контекст
+        # 4. Формируем контекст из наиболее релевантных документов
         context_parts = []
         used_docs = []
         
         for doc, score in sorted_docs:
-            if score > 0.95:
+            if score > 0.95:  # Слишком низкая релевантность
                 continue
             
             if not context_supports_question(doc.page_content, question, min_matches=1):
@@ -865,13 +1074,39 @@ def create_app() -> FastAPI:
                 break
         
         if not context_parts:
-            logger.warning("Не найдено достаточно релевантных документов")
-            return no_answer(priority, found_docs=True)
+            logger.warning("⚠️ Не найдено достаточно релевантных документов")
+            # Всегда эскалируем если нет релевантных документов
+            confidence = 0.2  # Очень низкая уверенность
+            confidence_details = {
+                "calculation_time": datetime.now().isoformat(),
+                "factors": {"no_relevant_documents": "Не найдено релевантных документов"},
+                "interpretation": "Очень низкая уверенность (нет релевантных документов)"
+            }
+            
+            needs_escalation = True
+            escalation_reason = "Не найдено релевантной информации по вашему вопросу"
+            
+            escalation_level, level_reason = get_escalation_level(priority, confidence)
+            answer_text, final_route = generate_low_confidence_response(
+                priority, confidence, f"{escalation_reason}. {level_reason}"
+            )
+            
+            return Answer(
+                answer=answer_text,
+                sources=[],
+                priority=priority.lower(),
+                route_to=final_route,
+                judge_reason=f"Недостаточно релевантных документов. {escalation_reason}",
+                confidence=confidence,
+                confidence_details=confidence_details,
+                confidence_interpretation="Очень низкая уверенность (нет релевантных документов)",
+                confidence_below_threshold=True
+            )
         
         context = "\n\n".join(context_parts)
-        logger.info(f"Использовано {len(context_parts)} документов для формирования ответа")
+        logger.info(f"📝 Использовано {len(context_parts)} документов для формирования ответа")
         
-        # 5. Генерируем ответ
+        # 5. Генерируем ответ НА ОСНОВАНИИ КОНТЕКСТА
         try:
             answer_chain = ANSWER_PROMPT | llm | StrOutputParser()
             answer_text = answer_chain.invoke({
@@ -879,21 +1114,50 @@ def create_app() -> FastAPI:
                 "question": question
             }).strip()
             
-            logger.info(f"Сгенерирован ответ на основе контекста")
+            logger.info(f"🤖 Сгенерирован ответ длиной {len(answer_text)} символов")
             
         except Exception as e:
-            logger.error(f"Ошибка генерации ответа: {e}")
+            logger.error(f"❌ Ошибка генерации ответа: {e}")
             answer_text = "Извините, произошла ошибка при формировании ответа. Пожалуйста, обратитесь в поддержку по телефону 900."
         
-        # 6. Рассчитываем уверенность
-        confidence, confidence_details = calculate_confidence(
-            used_docs, question, answer_text, context
+        # 6. Рассчитываем уверенность в ответе
+        confidence, confidence_details, interpretation = calculate_confidence(
+            used_docs, question, answer_text, context, priority
         )
         
         # Логируем метрики уверенности
         log_confidence_metrics(question, confidence, confidence_details)
         
-        # 7. Оцениваем ответ
+        # 7. Проверяем порог уверенности
+        needs_escalation, escalation_reason = needs_immediate_escalation(confidence, priority)
+        
+        if needs_escalation:
+            # 🔴 НИЗКАЯ УВЕРЕННОСТЬ - ЭСКАЛАЦИЯ БЕЗ ОТВЕТА
+            logger.warning(f"🚨 НИЗКАЯ УВЕРЕННОСТЬ ({confidence:.1%} < {CONFIDENCE_THRESHOLD:.0%}) - ЭСКАЛАЦИЯ")
+            
+            escalation_level, level_reason = get_escalation_level(priority, confidence)
+            answer_text, final_route = generate_low_confidence_response(
+                priority, confidence, escalation_reason
+            )
+            
+            sources = []  # Не показываем источники при низкой уверенности
+            
+            return Answer(
+                answer=answer_text,
+                sources=sources,
+                priority=priority.lower(),
+                route_to=final_route,
+                judge_reason=f"Низкая уверенность в ответе. {escalation_reason}",
+                confidence=confidence,
+                confidence_details=confidence_details,
+                confidence_interpretation=interpretation,
+                confidence_below_threshold=True
+            )
+        
+        # 8. Уверенность ВЫШЕ порога - продолжаем нормальную обработку
+        logger.info(f"✅ УВЕРЕННОСТЬ ВЫШЕ ПОРОГА ({confidence:.1%} >= {CONFIDENCE_THRESHOLD:.0%})")
+        
+        # 9. Оцениваем, насколько хорошо мы ответили и нужен ли сотрудник ПОСЛЕ ответа
         judge_result = judge_answer(
             llm=llm,
             question=question,
@@ -905,37 +1169,43 @@ def create_app() -> FastAPI:
         helped = judge_result.get("helped", True)
         final_priority = judge_result.get("priority", priority.lower())
         
-        # 8. Форматируем источники с URL
-        sources = format_sources(used_docs)
+        # 10. Форматируем источники с URL
+        sources = []
+        if helped and used_docs:
+            sources = format_sources(used_docs)
         
-        # 9. Улучшаем ответ для клиента (добавляем ссылки и маршрутизацию)
-        final_answer = generate_enhanced_answer(
-            answer_text, question, final_priority.upper(), helped, sources
-        )
+        # 11. Добавляем полезные ссылки к ответу
+        if sources and any(source.url for source in sources):
+            urls = [source.url for source in sources if source.url]
+            if urls:
+                links_text = "\n\n🔗 **Полезные ссылки:**\n"
+                for i, url in enumerate(urls[:3], 1):
+                    links_text += f"{i}. {url}\n"
+                answer_text += links_text
         
-        # 10. Маршрутизация
+        # 12. Определяем финальную маршрутизацию (если уверенность выше порога)
         route_to = judge_result.get("route_to")
         
-        if route_to:
-            logger.info(f"После ответа требуется маршрутизация на {route_to}")
-        else:
-            logger.info("Агент полностью справился с вопросом")
+        # Для high приоритета все равно маршрутизируем на L3
+        if final_priority == "high" and not route_to:
+            route_to = "L3"
+            judge_result["reason"] = "Высокий приоритет вопроса требует проверки специалистом"
         
-        # 11. Выводим детали уверенности в лог (для защиты проекта)
-        logger.info(f"📊 ДЕТАЛИ УВЕРЕННОСТИ для вопроса: '{question}'")
-        logger.info(f"   Оценка уверенности: {confidence:.2%}")
-        logger.info(f"   Интерпретация: {confidence_details.get('interpretation', 'N/A')}")
-        logger.info(f"   Использовано документов: {len(used_docs)}")
-        logger.info(f"   Средняя релевантность: {confidence_details.get('factors', {}).get('document_relevancy', {}).get('average', 0):.2%}")
+        if route_to:
+            logger.info(f"🔄 Маршрутизация на {route_to} после ответа")
+        else:
+            logger.info("🎯 Агент полностью справился с вопросом")
         
         return Answer(
-            answer=final_answer,
+            answer=answer_text,
             sources=sources,
             priority=final_priority,
             route_to=route_to,
             judge_reason=judge_result.get("reason", "Автоматическая оценка"),
             confidence=confidence,
-            confidence_details=confidence_details
+            confidence_details=confidence_details,
+            confidence_interpretation=interpretation,
+            confidence_below_threshold=False
         )
     
     @app.get("/health")
@@ -948,12 +1218,8 @@ def create_app() -> FastAPI:
                 "service": "SberBank Client Support AI",
                 "llm": "available",
                 "vectordb": "loaded",
-                "features": [
-                    "confidence_calculation",
-                    "url_linking", 
-                    "smart_routing",
-                    "detailed_analytics"
-                ],
+                "confidence_threshold": f"{CONFIDENCE_THRESHOLD:.0%}",
+                "logic": f"Эскалация если уверенность < {CONFIDENCE_THRESHOLD:.0%}",
                 "message": "Сервис готов к работе с клиентами"
             }
         except Exception as e:
@@ -964,6 +1230,52 @@ def create_app() -> FastAPI:
                 "llm": "unavailable",
                 "message": "Требуется проверка подключения к Ollama"
             }
+    
+    @app.get("/debug/confidence/{question}")
+    async def debug_confidence(question: str):
+        """Endpoint для отладки расчета уверенности"""
+        try:
+            # Ищем документы
+            docs_with_scores = vectordb.similarity_search_with_score(question, k=5)
+            
+            # Генерируем тестовый ответ
+            if docs_with_scores:
+                context = "\n".join([doc.page_content for doc, _ in docs_with_scores[:3]])
+                answer_chain = ANSWER_PROMPT | llm | StrOutputParser()
+                answer = answer_chain.invoke({"context": context, "question": question})
+            else:
+                context = ""
+                answer = "Информация не найдена"
+            
+            # Определяем приоритет
+            priority = detect_priority(llm, question)
+            
+            # Рассчитываем уверенность
+            confidence, details, interpretation = calculate_confidence(
+                docs_with_scores, question, answer, context, priority
+            )
+            
+            return {
+                "question": question,
+                "priority": priority,
+                "confidence": confidence,
+                "interpretation": interpretation,
+                "above_threshold": confidence >= CONFIDENCE_THRESHOLD,
+                "threshold": CONFIDENCE_THRESHOLD,
+                "details": details,
+                "documents_found": len(docs_with_scores),
+                "sample_documents": [
+                    {
+                        "relevancy": 1.0 - score,
+                        "score": score,
+                        "preview": doc.page_content[:200] + "..."
+                    }
+                    for doc, score in docs_with_scores[:3]
+                ] if docs_with_scores else [],
+                "answer_preview": answer[:500]
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Ошибка отладки: {str(e)}")
     
     return app
 

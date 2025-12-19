@@ -1,0 +1,1 @@
+{"timestamp": "2025-12-20T00:18:08.206157", "question": "как подключить оплату телефоном?", "real_confidence": 0.1, "display_confidence": 0.7, "buffer_applied": 0.2, "below_real_threshold": true, "interpretation": "Очень низкая уверенность (нет документов)", "priority": "unknown", "calculation_mode": "REAL_WITH_BUFFER"}
